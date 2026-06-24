@@ -1,0 +1,813 @@
+# HackXHarder — Developer Documentation
+
+**Bug Bounty & Responsible Disclosure Platform**
+System Architecture, Data Model, API Contract & Build Plan
+
+Version 1.0 | Confidential — Internal Engineering Use
+June 2026
+
+---
+
+## Table of Contents
+
+1. [Introduction](#1-introduction)
+2. [System Architecture](#2-system-architecture)
+3. [Core Modules](#3-core-modules)
+4. [Roles & Permissions](#4-roles--permissions)
+5. [Data Model](#5-data-model)
+6. [Vulnerability Report Lifecycle](#6-vulnerability-report-lifecycle)
+7. [API Specification](#7-api-specification)
+8. [Severity & Reward Reference](#8-severity--reward-reference)
+9. [Security Requirements](#9-security-requirements)
+10. [MVP Build Plan](#10-mvp-build-plan)
+11. [Appendix](#11-appendix)
+
+---
+
+## 1. Introduction
+
+### 1.1 Purpose of This Document
+
+This document is the primary engineering reference for HackXHarder, a bug bounty and responsible vulnerability disclosure platform. It is written for the developers, architects, and technical leads who will design, build, and maintain the system. It covers system architecture, the relational data model, REST API contracts, the report lifecycle, security controls, and a phased build plan from MVP to full platform.
+
+This is a living document. As modules are implemented, API contracts, schemas, and workflows should be updated here so the documentation never drifts from the running system.
+
+### 1.2 Product Summary
+
+HackXHarder connects three groups in one secure platform: companies that need their systems tested, ethical hackers (researchers) who test those systems within an approved scope, and a triage team that validates findings before they reach the company. The platform formalizes a process that today is often handled through ad-hoc email threads, with no tracking, no SLA, and no clear scope boundaries.
+
+The platform supports two program types:
+
+- **Vulnerability Disclosure Program (VDP)** — responsible disclosure without a guaranteed monetary reward.
+- **Bug Bounty Program (BBP)** — reward-based, with payouts tied to severity and impact.
+
+### 1.3 Document Conventions
+
+- Endpoints are written as `METHOD /path`.
+- Fields marked **(required)** must be present in the request body.
+- `snake_case` is used for all JSON fields and database columns; `PascalCase` for Django model classes.
+- All timestamps are stored and transmitted in UTC, ISO 8601 format.
+
+---
+
+## 2. System Architecture
+
+### 2.1 High-Level Architecture
+
+HackXHarder follows a decoupled architecture: a Next.js frontend communicates with a Django REST Framework backend over a versioned JSON API. PostgreSQL is the system of record; Redis backs caching, rate limiting, and background task queues.
+
+```text
+                        ┌─────────────────────────┐
+                        │   Next.js Frontend      │
+                        │   (Researcher / Company │
+                        │    / Triage / Admin UI)  │
+                        └────────────┬────────────┘
+                                     │ HTTPS / REST (JSON)
+                                     │ JWT Bearer Auth
+                        ┌────────────▼────────────┐
+                        │  Django REST Framework  │
+                        │  - Auth & Permissions    │
+                        │  - Business Logic        │
+                        │  - Serializers / ViewSets│
+                        └──┬──────────┬───────────┘
+                           │          │
+                  ┌────────▼──┐   ┌───▼─────────┐
+                  │ PostgreSQL │   │    Redis     │
+                  │ (primary   │   │ (cache, rate │
+                  │  datastore)│   │ limit, Celery│
+                  └────────────┘   │   broker)    │
+                                    └───┬──────────┘
+                                        │
+                              ┌─────────▼─────────┐
+                              │  Celery Workers     │
+                              │  - Email notif.      │
+                              │  - Report scoring    │
+                              │  - Scheduled jobs    │
+                              └──────────────────────┘
+
+        External services: S3-compatible object storage (report attachments),
+        SMTP/transactional email, SSLCommerz / bKash / Nagad (rewards payout).
+```
+
+### 2.2 Technology Stack
+
+| Layer | Technology | Notes |
+|---|---|---|
+| Frontend | Next.js 15 (App Router) | Server components for public pages; client components for dashboards |
+| Backend API | Django 5 + Django REST Framework | ViewSets + routers, versioned at `/api/v1/` |
+| Database | PostgreSQL 15+ | Primary relational store; JSONB for flexible scope/rules fields |
+| Cache / Queue Broker | Redis 7+ | Cache, login rate limiting, Celery broker/result backend |
+| Async Tasks | Celery + Celery Beat | Email, notifications, scheduled SLA checks |
+| Auth | JWT (SimpleJWT) with refresh rotation | Session-based fallback for admin Django panel only |
+| File Storage | S3-compatible (e.g., DigitalOcean Spaces / AWS S3) | Report attachments, never served from app servers directly |
+| Search (optional, post-MVP) | PostgreSQL full-text or Meilisearch | Program and report search |
+
+### 2.3 Environment Topology
+
+- **Development** — local Docker Compose: Django, Postgres, Redis, Celery worker, Next.js dev server.
+- **Staging** — mirrors production infra at smaller scale; used for QA and client demos.
+- **Production** — containerized deployment (Docker + a process manager such as Gunicorn/Uvicorn behind Nginx), PostgreSQL managed instance, Redis managed instance, S3-compatible storage, separate Celery worker and beat containers.
+
+### 2.4 Repository Structure (Suggested)
+
+```text
+hackxharder/
+├── backend/
+│   ├── config/                 # Django project settings, urls, wsgi/asgi
+│   ├── apps/
+│   │   ├── accounts/
+│   │   ├── researchers/
+│   │   ├── companies/
+│   │   ├── programs/
+│   │   ├── reports/
+│   │   ├── triage/
+│   │   ├── rewards/
+│   │   ├── notifications/
+│   │   ├── leaderboard/
+│   │   ├── auditlogs/
+│   │   ├── adminpanel/
+│   │   └── cms/
+│   ├── manage.py
+│   └── requirements.txt
+├── frontend/
+│   ├── app/
+│   ├── components/
+│   ├── lib/
+│   └── package.json
+└── docs/
+```
+
+---
+
+## 3. Core Modules
+
+The platform is split into twelve Django apps. Each app owns its own models, serializers, views, and permissions. This keeps the codebase modular and makes it possible to assign modules to different developers or sprints independently.
+
+| Module | Responsibility |
+|---|---|
+| `accounts` | Authentication, JWT issuance/refresh, password reset, 2FA, role assignment. |
+| `researchers` | Researcher profile, skill tags, reputation score, badges. |
+| `companies` | Company profile, verification, team members, analytics dashboard. |
+| `programs` | Program creation/approval, scope (in/out), rules, safe harbor, reward table. |
+| `reports` | Vulnerability report submission, status machine, comments, attachments. |
+| `triage` | Triage queue, severity adjustment, duplicate detection, bounty recommendation. |
+| `rewards` | Reward wallet, approval workflow, payout integration (bKash/Nagad/SSLCommerz). |
+| `notifications` | Email + in-app notifications for status changes and comments. |
+| `leaderboard` | Aggregated researcher rankings, monthly/all-time views. |
+| `auditlogs` | Immutable log of admin, company, and triage actions. |
+| `adminpanel` | Platform-wide admin operations: users, companies, programs, disputes. |
+| `cms` | Static/marketing pages, policy pages, help center content. |
+
+---
+
+## 4. Roles & Permissions
+
+### 4.1 Role Definitions
+
+| Role | Description |
+|---|---|
+| `researcher` | Independent security researcher who browses programs and submits reports. |
+| `company_admin` | Owner-level user for a registered company; manages program and team. |
+| `company_member` | Company team member assigned to specific reports by `company_admin`. |
+| `triage_analyst` | Platform-side analyst who validates and scores incoming reports. |
+| `platform_admin` | Full administrative access across the platform. |
+
+### 4.2 Permission Matrix
+
+Simplified matrix below. The actual implementation should use DRF permission classes combined with object-level checks (e.g., django-guardian or custom `has_object_permission` logic), never relying on frontend checks alone.
+
+| Action | Researcher | Company | Triage | Admin |
+|---|---|---|---|---|
+| View public programs | Yes | Own only | Yes | Yes |
+| Submit report | Yes | No | No | No |
+| View own reports | Yes | N/A | Yes | Yes |
+| View reports on own program | No | Yes | Yes | Yes |
+| Change report status | No | Limited | Yes | Yes |
+| Approve reward | No | Yes | Recommend | Yes |
+| Approve program | No | Submit only | No | Yes |
+| Approve company | No | No | No | Yes |
+| View audit logs | No | No | No | Yes |
+
+> **Security Note:** Role checks must always be enforced server-side at the object level. A researcher must never be able to fetch a report by ID outside their own ownership, and a company must never be able to fetch a report outside its own program, even if they guess a valid UUID.
+
+---
+
+## 5. Data Model
+
+The schema below is the recommended baseline for the MVP and is designed to extend cleanly into the post-MVP feature set (private programs, CVSS scoring, SLA tracking) without breaking migrations.
+
+### 5.1 Entity Relationship Overview
+
+```text
+User ──1:1── ResearcherProfile
+User ──1:1── CompanyProfile (for company_admin owner)
+CompanyProfile ──1:N── CompanyTeamMember ──N:1── User
+CompanyProfile ──1:N── Program
+Program ──1:N── ScopeAsset (in_scope / out_of_scope)
+Program ──1:N── RewardTier
+Program ──1:N── VulnerabilityReport
+ResearcherProfile ──1:N── VulnerabilityReport
+VulnerabilityReport ──1:N── ReportComment
+VulnerabilityReport ──1:N── ReportAttachment
+VulnerabilityReport ──1:N── ReportStatusHistory
+VulnerabilityReport ──1:1── Reward (nullable)
+VulnerabilityReport ──N:1── TriageAnalyst (assigned_to, nullable)
+User ──1:N── AuditLogEntry
+```
+
+### 5.2 Core Tables
+
+#### 5.2.1 User (`accounts`)
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | UUID, PK | Primary key for all user-facing IDs (avoid sequential IDs for security) |
+| `email` | varchar(255), unique | Used as login identifier |
+| `password_hash` | varchar(255) | Django's PBKDF2/Argon2 hasher |
+| `role` | varchar(20) | `researcher` \| `company_admin` \| `company_member` \| `triage_analyst` \| `platform_admin` |
+| `is_active` | boolean | Soft-disable without deleting |
+| `is_2fa_enabled` | boolean | Required true for `company_admin` and `platform_admin` |
+| `created_at` | timestamp | |
+| `updated_at` | timestamp | |
+
+#### 5.2.2 ResearcherProfile (`researchers`)
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | UUID, PK | |
+| `user_id` | UUID, FK → User | 1:1 |
+| `display_name` | varchar(100) | |
+| `bio` | text | Nullable |
+| `skill_tags` | JSONB | Array of strings, e.g. `["web", "mobile", "api"]` |
+| `reputation_score` | integer, default 0 | Derived from accepted reports and severity |
+| `country` | varchar(100) | Nullable |
+| `wallet_balance` | decimal(12,2), default 0 | Denormalized cache of approved + paid rewards |
+
+#### 5.2.3 CompanyProfile (`companies`)
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | UUID, PK | |
+| `owner_user_id` | UUID, FK → User | `company_admin` |
+| `company_name` | varchar(150) | |
+| `website` | varchar(255) | |
+| `verification_status` | varchar(20) | `pending` \| `verified` \| `rejected` |
+| `verification_notes` | text | Internal, admin-only |
+| `logo_url` | varchar(255) | Nullable |
+| `created_at` | timestamp | |
+
+#### 5.2.4 Program (`programs`)
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | UUID, PK | |
+| `company_id` | UUID, FK → CompanyProfile | |
+| `title` | varchar(150) | |
+| `program_type` | varchar(20) | `vdp` \| `bbp` |
+| `visibility` | varchar(10) | `public` \| `private` (private is post-MVP) |
+| `status` | varchar(20) | `draft` \| `pending_approval` \| `approved` \| `paused` \| `closed` |
+| `description` | text | |
+| `rules` | text | |
+| `safe_harbor_policy` | text | Nullable |
+| `created_at` / `updated_at` | timestamp | |
+
+#### 5.2.5 ScopeAsset (`programs`)
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | UUID, PK | |
+| `program_id` | UUID, FK → Program | |
+| `asset_type` | varchar(30) | `domain` \| `api` \| `mobile_app` \| `source_code` \| `other` |
+| `asset_value` | varchar(255) | e.g. `*.example.com` |
+| `scope` | varchar(15) | `in_scope` \| `out_of_scope` |
+| `notes` | text | Nullable |
+
+#### 5.2.6 RewardTier (`programs`)
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | UUID, PK | |
+| `program_id` | UUID, FK → Program | |
+| `severity` | varchar(15) | `critical` \| `high` \| `medium` \| `low` \| `informational` |
+| `min_amount` | decimal(12,2) | BDT |
+| `max_amount` | decimal(12,2) | BDT |
+
+#### 5.2.7 VulnerabilityReport (`reports`)
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | UUID, PK | |
+| `program_id` | UUID, FK → Program | |
+| `researcher_id` | UUID, FK → ResearcherProfile | |
+| `title` | varchar(200) | |
+| `description` | text | |
+| `steps_to_reproduce` | text | |
+| `proof_of_concept` | text | Nullable; may reference attachment IDs |
+| `affected_asset` | varchar(255) | |
+| `severity` | varchar(15) | Set by researcher initially, adjustable by triage |
+| `cvss_score` | decimal(3,1) | Nullable, post-MVP |
+| `status` | varchar(25) | See Section 6.2 Report Status List |
+| `assigned_triage_id` | UUID, FK → User | Nullable |
+| `duplicate_of_id` | UUID, FK → VulnerabilityReport | Nullable, self-referential |
+| `submitted_at` | timestamp | |
+| `resolved_at` | timestamp | Nullable |
+| `closed_at` | timestamp | Nullable |
+
+#### 5.2.8 ReportStatusHistory (`reports`)
+
+Append-only table; never updated, only inserted. This is the audit trail for the report lifecycle and is what powers SLA tracking in the post-MVP phase.
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | UUID, PK | |
+| `report_id` | UUID, FK → VulnerabilityReport | |
+| `from_status` | varchar(25) | Nullable for the first entry |
+| `to_status` | varchar(25) | |
+| `changed_by_id` | UUID, FK → User | |
+| `note` | text | Nullable |
+| `created_at` | timestamp | |
+
+#### 5.2.9 ReportComment (`reports`)
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | UUID, PK | |
+| `report_id` | UUID, FK → VulnerabilityReport | |
+| `author_id` | UUID, FK → User | |
+| `body` | text | |
+| `is_internal` | boolean, default false | `true` = triage/company-only note, hidden from researcher |
+| `created_at` | timestamp | |
+
+#### 5.2.10 ReportAttachment (`reports`)
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | UUID, PK | |
+| `report_id` | UUID, FK → VulnerabilityReport | |
+| `uploaded_by_id` | UUID, FK → User | |
+| `file_url` | varchar(500) | S3 object key/URL, never local disk path |
+| `file_name` | varchar(255) | |
+| `file_size_bytes` | integer | |
+| `content_type` | varchar(100) | Validated against an allow-list |
+| `scanned_status` | varchar(20) | `pending` \| `clean` \| `flagged` |
+
+#### 5.2.11 Reward (`rewards`)
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | UUID, PK | |
+| `report_id` | UUID, FK → VulnerabilityReport | 1:1 |
+| `amount` | decimal(12,2) | BDT |
+| `status` | varchar(20) | `recommended` \| `approved` \| `processing` \| `paid` \| `rejected` |
+| `payout_method` | varchar(20) | `bkash` \| `nagad` \| `sslcommerz` \| `bank_transfer` |
+| `payout_reference` | varchar(100) | Nullable, external transaction ID |
+| `approved_by_id` | UUID, FK → User | Nullable |
+| `paid_at` | timestamp | Nullable |
+
+#### 5.2.12 AuditLogEntry (`auditlogs`)
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | UUID, PK | |
+| `actor_id` | UUID, FK → User | |
+| `action` | varchar(100) | e.g. `program.approved`, `report.status_changed` |
+| `target_type` | varchar(50) | Model name |
+| `target_id` | UUID | |
+| `metadata` | JSONB | Before/after values where relevant |
+| `ip_address` | varchar(45) | |
+| `created_at` | timestamp | |
+
+> **Schema Notes**
+> - All primary keys are UUIDs, not auto-increment integers, to prevent ID enumeration of reports and programs.
+> - `ReportStatusHistory` and `AuditLogEntry` are append-only — never issue UPDATE or DELETE against these tables from application code.
+> - `wallet_balance` on `ResearcherProfile` is a denormalized cache; the `Reward` table is the source of truth and should be recomputed/reconciled periodically.
+
+---
+
+## 6. Vulnerability Report Lifecycle
+
+### 6.1 Workflow Diagram
+
+```text
+Researcher submits report
+        │
+        ▼
+   status = NEW  ──────────────► Triage reviews
+                                       │
+                       ┌───────────────┼────────────────┐
+                       ▼               ▼                ▼
+                  NOT_APPLICABLE   DUPLICATE      NEEDS_MORE_INFO
+                  / INFORMATIVE    (linked to            │
+                  / OUT_OF_SCOPE   original)        researcher replies
+                  (terminal)       (terminal)             │
+                                                           ▼
+                                                    back to NEW/TRIAGED
+                       │
+                       ▼ (valid)
+                   TRIAGED ──► forwarded to company
+                       │
+                       ▼
+                   ACCEPTED ──► company fixes the issue
+                       │
+                       ▼
+                  RETESTING ──► researcher / triage retest
+                       │
+                       ▼
+                  RESOLVED
+                       │
+                       ▼
+             REWARD_APPROVED ──► payout processed
+                       │
+                       ▼
+                    PAID
+                       │
+                       ▼
+                   CLOSED
+
+  Any state can transition to DISPUTED if the researcher contests
+  a decision; a platform_admin resolves disputes manually.
+```
+
+### 6.2 Report Status List
+
+| Status | Meaning | Terminal? |
+|---|---|---|
+| `new` | Just submitted, awaiting triage | No |
+| `needs_more_information` | Triage requested clarification from researcher | No |
+| `triaged` | Validated as a real, in-scope issue; forwarded to company | No |
+| `accepted` | Company has acknowledged and is working a fix | No |
+| `duplicate` | Matches an existing report | Yes |
+| `informative` | Valid observation, not a security risk requiring a fix | Yes |
+| `not_applicable` | Not a valid vulnerability | Yes |
+| `out_of_scope` | Target/asset was not covered by the program scope | Yes |
+| `retesting` | Fix deployed; awaiting confirmation | No |
+| `resolved` | Fix confirmed effective | No |
+| `reward_approved` | Company/triage approved a reward amount | No |
+| `paid` | Reward payout completed | No |
+| `closed` | Report fully closed out | Yes |
+| `disputed` | Researcher has contested a decision | No (until resolved) |
+
+### 6.3 State Machine Implementation Notes
+
+- Implement transitions as an explicit allow-list (e.g., a dict mapping `current_status → [allowed_next_statuses]`), not free-form status writes. Reject any transition not in the allow-list with HTTP 400.
+- Every transition must write a `ReportStatusHistory` row in the same database transaction as the status update.
+- Only `triage_analyst` and `platform_admin` can move a report into `triaged`, `duplicate`, `informative`, `not_applicable`, or `out_of_scope`.
+- Only `company_admin`/`company_member` (with triage oversight) can move a report into `accepted` or `resolved`.
+- Reward-related transitions (`reward_approved`, `paid`) require a non-null `Reward` record with a matching status.
+
+---
+
+## 7. API Specification
+
+Base URL: `/api/v1/`. All endpoints return JSON. All list endpoints are paginated using `limit`/`offset` query parameters and return `{ count, next, previous, results }`. Authenticated endpoints require `Authorization: Bearer <access_token>`.
+
+### 7.1 Authentication
+
+**`POST /api/v1/auth/register/`**
+
+Registers a new user. Role defaults to `researcher`; company registration uses a separate endpoint that also creates a `CompanyProfile`.
+
+```text
+Request body:
+{
+  "email": "user@example.com",       // required
+  "password": "string",              // required, min 12 chars
+  "role": "researcher"               // required: researcher | company_admin
+}
+
+Response 201:
+{
+  "id": "uuid",
+  "email": "user@example.com",
+  "role": "researcher"
+}
+```
+
+**`POST /api/v1/auth/login/`**
+
+```text
+Request body:
+{ "email": "user@example.com", "password": "string" }
+
+Response 200:
+{
+  "access": "jwt...",
+  "refresh": "jwt...",
+  "user": { "id": "uuid", "role": "researcher" }
+}
+
+Response 401: { "detail": "Invalid credentials" }
+Note: rate-limited (see Section 9.4).
+```
+
+**`POST /api/v1/auth/refresh/`**
+
+```text
+Request body: { "refresh": "jwt..." }
+Response 200: { "access": "jwt..." }
+```
+
+**`POST /api/v1/auth/2fa/verify/`**
+
+Required step after login for `company_admin` and `platform_admin` accounts before a usable access token is issued.
+
+### 7.2 Researcher Profile
+
+| Endpoint | Description |
+|---|---|
+| `GET /api/v1/researchers/me/` | Get the authenticated researcher's profile |
+| `PATCH /api/v1/researchers/me/` | Update bio, skill_tags, display_name |
+| `GET /api/v1/researchers/{id}/` | Public profile view (reputation, badges, public stats) |
+
+### 7.3 Companies
+
+| Endpoint | Description |
+|---|---|
+| `POST /api/v1/companies/register/` | Register a new company; creates CompanyProfile + owner User |
+| `GET /api/v1/companies/me/` | Get the authenticated company's profile |
+| `PATCH /api/v1/companies/me/` | Update company profile fields |
+| `POST /api/v1/companies/me/team/` | Invite a company_member to the team |
+| `GET /api/v1/companies/me/analytics/` | Dashboard metrics: open reports, avg. resolution time, spend |
+
+### 7.4 Programs
+
+| Endpoint | Description |
+|---|---|
+| `GET /api/v1/programs/` | List public, approved programs (filterable by program_type, severity range) |
+| `GET /api/v1/programs/{id}/` | Program detail including scope and reward table |
+| `POST /api/v1/programs/` | Create a draft program (company_admin only) |
+| `PATCH /api/v1/programs/{id}/` | Update a draft/approved program (owner company only) |
+| `POST /api/v1/programs/{id}/submit-for-approval/` | Move status draft → pending_approval |
+| `POST /api/v1/programs/{id}/approve/` | Admin-only: pending_approval → approved |
+| `POST /api/v1/programs/{id}/scope/` | Add a ScopeAsset entry |
+| `POST /api/v1/programs/{id}/reward-tiers/` | Define/update RewardTier rows |
+
+**Example: `GET /api/v1/programs/{id}/`**
+
+```text
+Response 200:
+{
+  "id": "uuid",
+  "title": "Acme Corp Bug Bounty",
+  "program_type": "bbp",
+  "status": "approved",
+  "description": "...",
+  "rules": "...",
+  "safe_harbor_policy": "...",
+  "scope": {
+    "in_scope": [{ "asset_type": "domain", "asset_value": "*.acme.com" }],
+    "out_of_scope": [{ "asset_type": "domain", "asset_value": "blog.acme.com" }]
+  },
+  "reward_tiers": [
+    { "severity": "critical", "min_amount": "20000.00", "max_amount": "100000.00" },
+    { "severity": "high", "min_amount": "10000.00", "max_amount": "50000.00" }
+  ]
+}
+```
+
+### 7.5 Vulnerability Reports
+
+| Endpoint | Description |
+|---|---|
+| `POST /api/v1/reports/` | Submit a new report (researcher only) |
+| `GET /api/v1/reports/` | List reports scoped to the caller's role (own reports / own program / assigned) |
+| `GET /api/v1/reports/{id}/` | Report detail (object-level permission enforced) |
+| `PATCH /api/v1/reports/{id}/status/` | Transition report status (allow-listed transitions only) |
+| `POST /api/v1/reports/{id}/comments/` | Add a comment (is_internal flag for triage/company-only notes) |
+| `POST /api/v1/reports/{id}/attachments/` | Upload a file attachment (multipart/form-data) |
+| `GET /api/v1/reports/{id}/history/` | Full ReportStatusHistory for the report |
+
+**Example: `POST /api/v1/reports/`**
+
+```text
+Request body:
+{
+  "program_id": "uuid",                       // required
+  "title": "SQL Injection in /api/search",     // required
+  "description": "...",                       // required
+  "steps_to_reproduce": "...",                 // required
+  "affected_asset": "api.acme.com/search",     // required
+  "severity": "high"                           // required, researcher's initial estimate
+}
+
+Response 201:
+{ "id": "uuid", "status": "new", "submitted_at": "2026-06-24T10:00:00Z" }
+
+Response 429: rate limited (see Section 9.4)
+```
+
+### 7.6 Triage
+
+| Endpoint | Description |
+|---|---|
+| `GET /api/v1/triage/queue/` | Reports with status=new awaiting review, sorted by SLA risk |
+| `POST /api/v1/triage/reports/{id}/assign/` | Self-assign or assign to another triage_analyst |
+| `PATCH /api/v1/triage/reports/{id}/severity/` | Adjust severity from the researcher's initial estimate |
+| `POST /api/v1/triage/reports/{id}/mark-duplicate/` | Link to an existing report; sets status=duplicate |
+| `POST /api/v1/triage/reports/{id}/recommend-reward/` | Suggest a reward amount within the program's tier range |
+
+### 7.7 Rewards
+
+| Endpoint | Description |
+|---|---|
+| `GET /api/v1/rewards/wallet/` | Researcher's wallet balance and reward history |
+| `POST /api/v1/rewards/{report_id}/approve/` | Company approves the reward amount |
+| `POST /api/v1/rewards/{report_id}/payout/` | Trigger payout via configured gateway (admin/company) |
+| `GET /api/v1/rewards/{report_id}/` | Reward detail and payout status |
+
+### 7.8 Admin
+
+| Endpoint | Description |
+|---|---|
+| `GET /api/v1/admin/companies/pending/` | Companies awaiting verification |
+| `POST /api/v1/admin/companies/{id}/approve/` | Approve or reject a company |
+| `GET /api/v1/admin/programs/pending/` | Programs awaiting approval |
+| `GET /api/v1/admin/disputes/` | List open disputes |
+| `POST /api/v1/admin/disputes/{id}/resolve/` | Resolve a dispute with a final decision |
+| `GET /api/v1/admin/audit-logs/` | Searchable audit trail |
+
+### 7.9 Standard Error Format
+
+```json
+{
+  "error": {
+    "code": "REPORT_INVALID_TRANSITION",
+    "message": "Cannot move report from 'duplicate' to 'accepted'.",
+    "field_errors": {}
+  }
+}
+```
+
+---
+
+## 8. Severity & Reward Reference
+
+### 8.1 Severity Levels
+
+| Severity | Description |
+|---|---|
+| Critical | Vulnerability that can fully compromise system, data, or users |
+| High | Serious vulnerability with major business or technical impact |
+| Medium | Moderate risk vulnerability requiring valid conditions |
+| Low | Minor vulnerability with limited impact |
+| Informational | Security observation or best-practice issue |
+
+### 8.2 Default Bounty Reward Range (BDT)
+
+| Severity | Reward Range |
+|---|---|
+| Critical | 20,000 – 100,000 BDT |
+| High | 10,000 – 50,000 BDT |
+| Medium | 3,000 – 20,000 BDT |
+| Low | 500 – 5,000 BDT |
+| Informational | Points only or no reward |
+
+These ranges are platform defaults shown to companies when creating a program; each company can override them per program via RewardTier records, within platform-defined min/max guardrails to prevent abuse.
+
+---
+
+## 9. Security Requirements
+
+HackXHarder stores sensitive, pre-disclosure vulnerability information. A breach of this platform would itself be a serious security incident affecting every client company. Security is not a post-MVP feature — the items below are mandatory for the MVP release.
+
+### 9.1 Transport & Session Security
+
+- Enforce HTTPS everywhere; HTTP requests redirect to HTTPS at the load balancer/Nginx layer.
+- Set `Strict-Transport-Security`, `X-Content-Type-Options`, `X-Frame-Options`, and a restrictive `Content-Security-Policy`.
+- JWT access tokens short-lived (15 minutes); refresh tokens rotated on use and revocable server-side (store refresh token IDs, not just trust the JWT signature).
+- Two-factor authentication required for `company_admin` and `platform_admin` roles; recommended for researcher accounts.
+
+### 9.2 Authentication & Password Policy
+
+- Minimum 12-character passwords; check against a breached-password list (e.g., via the Pwned Passwords API range query) at registration and password change.
+- Passwords hashed with Argon2 or PBKDF2 (Django's default), never stored or logged in plaintext.
+- Account lockout / exponential backoff after repeated failed login attempts, tracked per-account and per-IP in Redis.
+
+### 9.3 Authorization & Data Isolation
+
+- Every object-level endpoint must verify ownership/role at the query level (filter querysets by request.user's role and related IDs), not just at the URL/view level — this is the platform's primary defense against IDOR.
+- Vulnerability reports are private by default: visible only to the submitting researcher, the owning company's team, assigned triage analysts, and platform admins.
+- Internal triage notes (`is_internal=true` comments) must never be serialized into a researcher-facing API response, even if the researcher requests the report by ID.
+
+### 9.4 Rate Limiting
+
+| Endpoint / Action | Suggested Limit |
+|---|---|
+| `POST /auth/login/` | 5 attempts / 15 minutes per IP + per account |
+| `POST /auth/register/` | 10 / hour per IP |
+| `POST /reports/` (submission) | 20 / hour per researcher account |
+| `POST /reports/{id}/comments/` | 60 / hour per account |
+| File attachment upload | 30 / hour per account |
+
+Implement using Redis-backed counters (e.g., django-ratelimit or a custom DRF throttle class). Return HTTP 429 with a `Retry-After` header on limit breach.
+
+### 9.5 File Upload Validation
+
+- Validate file extension and MIME type against an explicit allow-list (e.g., png, jpg, pdf, txt, log, zip up to a defined size cap).
+- Re-derive the content type from file bytes server-side (do not trust the client-supplied Content-Type header).
+- Store all attachments in S3-compatible object storage outside the web root; serve via signed, time-limited URLs — never serve uploaded files directly from an application server path.
+- Run uploaded files through an antivirus/malware scan (e.g., ClamAV) asynchronously via Celery; mark `scanned_status` accordingly and block download until scanned.
+
+### 9.6 Standard Web Vulnerability Defenses
+
+| Threat | Primary Defense |
+|---|---|
+| SQL Injection | Django ORM / parameterized queries only; no raw SQL string interpolation |
+| XSS | Next.js auto-escaping by default; sanitize any HTML the frontend renders from user content; strict CSP |
+| CSRF | JWT bearer auth for the API (not cookie-based) removes most CSRF risk; if cookies are used anywhere (e.g., Django admin), enable Django's CSRF middleware |
+| SSRF | Never let server-side code fetch arbitrary user-supplied URLs (e.g., for link previews) without an allow-list and internal-IP blocking |
+| IDOR | Object-level permission checks on every queryset (see Section 9.3) |
+| Mass assignment | Explicit serializer fields (`fields = [...]`) — never serializers using `fields = '__all__'` on writable endpoints |
+
+### 9.7 Logging, Auditing & Backups
+
+- All admin, triage, and company actions that change state are written to `AuditLogEntry` inside the same transaction as the change.
+- Application logs must never contain passwords, tokens, full report bodies, or unredacted PII; use structured logging with explicit allow-listed fields.
+- Automated, encrypted, daily PostgreSQL backups with tested restore procedure; retain at minimum 30 days.
+- Centralized log aggregation with alerting on repeated authentication failures, privilege escalation attempts, and unusual admin activity.
+
+### 9.8 Sensitive Data Handling
+
+- Encrypt sensitive fields at rest where the database-level encryption is insufficient (e.g., payout account details) using application-level field encryption.
+- Apply data retention rules: closed reports and associated PII should have a defined retention/anonymization policy in line with applicable data protection requirements.
+
+> **Pre-Launch Security Checklist**
+> - Run an authenticated penetration test against staging before public launch — this platform's own credibility depends on practicing what it sells.
+> - Confirm object-level permission tests exist for every report, program, and reward endpoint, with automated tests for cross-tenant access attempts.
+> - Confirm rate limiting is active in production config (not only in code) before go-live.
+
+---
+
+## 10. MVP Build Plan
+
+### 10.1 MVP Scope
+
+The MVP focuses on proving the core loop: a company can publish a program, a researcher can submit a report against it, and that report can move through a status pipeline to resolution — with the minimum security baseline from Section 9 fully in place from day one.
+
+- User registration and login (JWT)
+- Role-based dashboard (researcher / company / admin)
+- Researcher profile
+- Company profile + admin company approval
+- Program creation + program approval
+- Public program listing + program detail page
+- Vulnerability report submission
+- Report inbox + report detail page
+- Comment system
+- Report status update (allow-listed transitions)
+- Basic reward amount field (manual, no payment gateway yet)
+- Email notification on status change
+- Basic admin dashboard
+
+### 10.2 Suggested Sprint Breakdown (8 Weeks)
+
+| Sprint | Focus | Key Deliverables |
+|---|---|---|
+| Sprint 1 (Wk 1-2) | Foundations | Project scaffolding, accounts app, JWT auth, role model, CI pipeline |
+| Sprint 2 (Wk 3-4) | Company & Program | companies + programs apps, admin approval flows, public program listing |
+| Sprint 3 (Wk 5-6) | Reports Core | reports app, status state machine, comments, basic attachment upload |
+| Sprint 4 (Wk 7) | Rewards & Notifications | Manual reward field, Celery email notifications, researcher dashboard |
+| Sprint 5 (Wk 8) | Admin & Hardening | Admin dashboard, audit logging, rate limiting, security pass, staging deploy |
+
+### 10.3 Post-MVP Roadmap
+
+1. Private bug bounty programs and researcher invitation system
+2. CVSS calculator integrated into report submission
+3. Automated duplicate detection (text similarity on title/description/affected_asset)
+4. SLA tracking dashboards driven by ReportStatusHistory timestamps
+5. Public disclosure reports (opt-in, post-resolution)
+6. Researcher badges and monthly leaderboard
+7. Payment gateway integration: SSLCommerz, then bKash/Nagad direct payout
+8. Jira / GitHub integration for company-side remediation tracking
+9. AI-assisted report quality checks and duplicate-report flagging
+10. Mobile app (researcher-focused: submission and status tracking on the go)
+11. Organization team management (multiple admins, granular company-side roles)
+12. Compliance reporting exports for enterprise clients
+
+---
+
+## 11. Appendix
+
+### 11.1 Glossary
+
+| Term | Definition |
+|---|---|
+| VDP | Vulnerability Disclosure Program — responsible disclosure without a guaranteed reward |
+| BBP | Bug Bounty Program — reward-based program |
+| Triage | The validation step between report submission and company review |
+| Scope | The defined set of assets a researcher is authorized to test |
+| Safe Harbor | Legal assurance protecting researchers who test within the defined scope and rules |
+| IDOR | Insecure Direct Object Reference — an authorization flaw allowing access to objects by guessing/altering an identifier |
+| SLA | Service Level Agreement — target time-to-respond/resolve commitments |
+
+### 11.2 Open Questions for Product/Engineering Alignment
+
+- Final payout flow: does the platform hold researcher funds in escrow, or does the company pay out directly with the platform only recording the transaction?
+- KYC requirements for researcher payouts above a certain threshold, given Bangladesh financial regulations.
+- Whether triage is an in-house platform team or whether companies may opt into self-triage for the MVP.
+- Data residency requirements if any client company requires in-country data storage.
+
+### 11.3 Document History
+
+| Version | Date | Change |
+|---|---|---|
+| 1.0 | June 2026 | Initial developer documentation drafted from project idea brief |

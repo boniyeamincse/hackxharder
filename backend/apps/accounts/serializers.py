@@ -4,7 +4,7 @@ from django.utils.timezone import now
 from datetime import timedelta
 import uuid
 
-from .models import User, Profile, TwoFactorAuthentication, PasswordReset
+from .models import User, Profile, TwoFactorAuthentication, PasswordReset, UserSession, EmailVerification, SecurityEvent, Invitation
 
 
 class UserSerializer(serializers.ModelSerializer):
@@ -164,6 +164,13 @@ class TwoFactorVerifySerializer(serializers.Serializer):
     code = serializers.CharField(min_length=6, max_length=6)
 
 
+class Login2FAVerifySerializer(serializers.Serializer):
+    """Serializer for 2FA verification during login."""
+
+    user_id = serializers.UUIDField()
+    code = serializers.CharField(min_length=6, max_length=6)
+
+
 class ChangePasswordSerializer(serializers.Serializer):
     """Serializer for changing password."""
 
@@ -174,4 +181,54 @@ class ChangePasswordSerializer(serializers.Serializer):
     def validate(self, attrs):
         if attrs['new_password'] != attrs['new_password2']:
             raise serializers.ValidationError({'new_password': 'Passwords do not match.'})
+        return attrs
+
+
+class UserSessionSerializer(serializers.ModelSerializer):
+    """Serializer for user sessions."""
+
+    class Meta:
+        model = UserSession
+        fields = [
+            'id', 'ip_address', 'device_info', 'user_agent',
+            'created_at', 'last_activity', 'is_active'
+        ]
+        read_only_fields = fields
+
+
+class EmailVerifySerializer(serializers.Serializer):
+    """Serializer for email verification."""
+    token = serializers.CharField()
+
+
+class EmailResendSerializer(serializers.Serializer):
+    """Serializer to resend email verification."""
+    email = serializers.EmailField()
+
+
+class SecurityEventSerializer(serializers.ModelSerializer):
+    """Serializer for security events/login history."""
+    
+    class Meta:
+        model = SecurityEvent
+        fields = ['id', 'event_type', 'ip_address', 'user_agent', 'metadata', 'created_at']
+        read_only_fields = fields
+
+
+class InvitationVerifySerializer(serializers.Serializer):
+    """Serializer to verify an invitation token."""
+    token = serializers.CharField()
+
+
+class InvitationAcceptSerializer(serializers.Serializer):
+    """Serializer to accept an invitation and set password."""
+    token = serializers.CharField()
+    password = serializers.CharField(write_only=True, min_length=12)
+    password2 = serializers.CharField(write_only=True, min_length=12)
+    first_name = serializers.CharField(max_length=150)
+    last_name = serializers.CharField(max_length=150)
+
+    def validate(self, attrs):
+        if attrs['password'] != attrs['password2']:
+            raise serializers.ValidationError({'password': 'Passwords do not match.'})
         return attrs

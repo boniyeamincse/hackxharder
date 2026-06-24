@@ -129,7 +129,7 @@ SPECTACULAR_SETTINGS = {
     'TITLE': 'HackXHarder API',
     'DESCRIPTION': 'Bug Bounty and Vulnerability Disclosure Platform',
     'VERSION': '1.0.0',
-    'SERVE_PERMISSIONS': ['rest_framework.permissions.IsAdminUser'],
+    'SERVE_PERMISSIONS': ['rest_framework.permissions.AllowAny'],
     'SCHEMA_PATH_PREFIX': '/api/v1/',
 }
 

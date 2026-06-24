@@ -161,3 +161,85 @@ class UserSession(models.Model):
 
     def __str__(self):
         return f"Session of {self.user.email}"
+
+
+class EmailVerification(models.Model):
+    """Email verification tokens."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='email_verifications')
+    
+    token = models.CharField(max_length=255, unique=True)
+    is_verified = models.BooleanField(default=False)
+    
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField()
+
+    class Meta:
+        db_table = 'accounts_email_verification'
+        verbose_name = _('Email Verification')
+        verbose_name_plural = _('Email Verifications')
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"Email Verification for {self.user.email}"
+
+
+class SecurityEvent(models.Model):
+    """Audit log for security events."""
+
+    EVENT_CHOICES = (
+        ('LOGIN', _('Login Successful')),
+        ('FAILED_LOGIN', _('Login Failed')),
+        ('LOGOUT', _('Logout')),
+        ('PASSWORD_CHANGE', _('Password Changed')),
+        ('PASSWORD_RESET', _('Password Reset')),
+        ('2FA_ENABLED', _('2FA Enabled')),
+        ('2FA_DISABLED', _('2FA Disabled')),
+        ('ACCOUNT_DEACTIVATED', _('Account Deactivated')),
+        ('ACCOUNT_REACTIVATED', _('Account Reactivated')),
+    )
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='security_events', null=True, blank=True)
+    
+    event_type = models.CharField(max_length=50, choices=EVENT_CHOICES)
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+    user_agent = models.TextField(blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'accounts_security_event'
+        verbose_name = _('Security Event')
+        verbose_name_plural = _('Security Events')
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.event_type} - {self.user.email if self.user else 'Unknown'}"
+
+
+class Invitation(models.Model):
+    """Invitations for users to join."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    email = models.EmailField()
+    role = models.CharField(max_length=20, choices=User.ROLE_CHOICES, default='RESEARCHER')
+    
+    token = models.CharField(max_length=255, unique=True)
+    invited_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='invitations_sent')
+    
+    is_accepted = models.BooleanField(default=False)
+    
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField()
+
+    class Meta:
+        db_table = 'accounts_invitation'
+        verbose_name = _('Invitation')
+        verbose_name_plural = _('Invitations')
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"Invitation to {self.email} ({self.role})"

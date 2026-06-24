@@ -1,0 +1,33 @@
+# Local Development - Redis Only
+# For full local dev: PostgreSQL, Backend, Frontend run on PC
+# This compose file is OPTIONAL - only for Redis (or use local Redis)
+
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7
+    container_name: hackxharder-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - redis_data:/data
+
+volumes:
+  redis_data:
+
+# Usage:
+# docker-compose up -d redis
+#
+# Then run locally:
+# - PostgreSQL: sudo systemctl start postgresql (or installed service)
+# - Backend: cd backend && python manage.py runserver 0.0.0.0:8000
+# - Frontend: cd frontend && npm run dev
+# - Celery: cd backend && celery -A config worker -l info
+#
+# See docs/LOCAL_SETUP.md for full instructions
